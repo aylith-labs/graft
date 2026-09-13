@@ -1,7 +1,7 @@
 {
-  "name": "@nanonets/graft",
+  "name": "@aylith/graft",
   "version": "0.18.0",
-  "description": "Build a repo's context graph as a folder of linked markdown files: a local, regenerable cache that every query keeps in sync with your code.",
+  "description": "Build a repo's context graph as a folder of linked markdown files: a local, regenerable cache that every query keeps in sync with your code. The Aylith Labs fork of trailhq/Graft, with no telemetry, cloud features or agent wiring.",
   "keywords": [
     "ai",
     "agents",
@@ -14,11 +14,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NanoNets/context-graph-engine.git"
+    "url": "git+https://github.com/aylith-labs/graft.git"
   },
-  "homepage": "https://github.com/NanoNets/context-graph-engine#readme",
+  "homepage": "https://github.com/aylith-labs/graft#readme",
   "bugs": {
-    "url": "https://github.com/NanoNets/context-graph-engine/issues"
+    "url": "https://github.com/aylith-labs/graft/issues"
   },
   "publishConfig": {
     "access": "public"
@@ -34,22 +34,21 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "graft": "dist/cli.js"
+    "aylith-graft": "dist/cli.js"
   },
   "files": [
     "dist",
-    "scripts",
     "README.md",
+    "FORK.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsc -p viewer/tsconfig.json && node scripts/build-viewer.mjs",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && tsc -p viewer/tsconfig.json && node scripts/build-viewer.mjs",
     "dev": "tsc -p tsconfig.json --watch",
     "cli": "tsx src/cli.ts",
     "test": "node scripts/run-tests.mjs",
-    "prepare": "npm run build && node scripts/stamp-telemetry-key.mjs",
-    "prepublishOnly": "npm run build",
-    "postinstall": "node scripts/postinstall.mjs"
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build"
   },
   "engines": {
     "node": ">=20"
@@ -57,7 +56,6 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
     "commander": "^15.0.0",
-    "dotenv": "^17.4.2",
     "gray-matter": "^4.0.3",
     "openai": "^6.45.0",
     "tree-sitter": "^0.21.1",
@@ -81,7 +79,7 @@
     "esbuild": "^0.28.1",
     "node-gyp": "^12.4.0",
     "tsx": "^4.22.4",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   },
   "allowScripts": {
     "tree-sitter@0.21.1": true,

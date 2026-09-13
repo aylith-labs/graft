@@ -51,6 +51,9 @@ jobs:
       # mapping (toolset v145); 12.x is also the newest line that still supports the
       # Node 20 this matrix pins, since 13.x requires >=22.22. Don't drop node-gyp
       # from devDependencies, and don't bump it past 12.x without moving Node first.
+      - name: Fork check
+        run: node scripts/fork-check.mjs
+
       - name: Install dependencies
         run: npm ci
 

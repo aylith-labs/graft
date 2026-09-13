@@ -1,3 +1,9 @@
+> **The Aylith Labs fork of [trailhq/Graft](https://github.com/trailhq/Graft)**, published as
+> `@aylith/graft` with the `aylith-graft` binary. It keeps the graph builder, retrieval, `blast`
+> and the MCP tools, and removes telemetry, the cloud brain, the GitHub App server, the upgrade
+> check and every command that writes agent configuration into a repository or a home directory.
+> The rest of this README is upstream's; [FORK.md](FORK.md) lists exactly what differs.
+
 <div align="center">
 
 <img src="assets/graft-hero.png" alt="Graft — open-source context layer for large codebases" width="100%"/>

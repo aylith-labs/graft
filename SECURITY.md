@@ -2,17 +2,14 @@
 
 ## Supported Versions
 
-Graft is pre-1.0 and ships continuously from `main`. Security fixes are made against
-the latest published npm release (`@nanonets/graft`); older versions are not
-separately patched.
+`@aylith/graft` ships from `main`. Security fixes are made against the latest published release;
+older versions are not separately patched.
 
 ## Reporting a Vulnerability
 
-Please do not open a public GitHub issue for security vulnerabilities.
+Please do not open a public GitHub issue for a security vulnerability.
 
-Report vulnerabilities privately via
-[GitHub Security Advisories](https://github.com/NanoNets/Graft/security/advisories/new),
-or email shrish@nanonets.com.
-
-We'll acknowledge your report within 3 business days and aim to ship a fix or
-mitigation within 30 days, depending on severity.
+Report it privately through
+[GitHub Security Advisories](https://github.com/aylith-labs/graft/security/advisories/new).
+A vulnerability in code this fork shares with [trailhq/Graft](https://github.com/trailhq/Graft)
+should also be reported upstream, through that repository's own security policy.

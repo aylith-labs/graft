@@ -44,3 +44,12 @@ export { ChatSummarizer } from "./ai/summarize.js";
 export type { Summarizer } from "./ai/summarize.js";
 export { ChatCruxSummarizer } from "./ai/crux.js";
 export type { CruxSummarizer, FileCruxInput, NodeCrux, NodeRef } from "./ai/crux.js";
+
+// Retrieval, for callers that embed the engine rather than shell out to the CLI.
+export { TOOLS, callTool } from "./mcp/tools.js";
+export type { ToolDef } from "./mcp/tools.js";
+export { ensureFreshGraph, refreshNote } from "./graph/refresh.js";
+export { mainWorktreeRoot } from "./graph/seed.js";
+export { contextDirFor } from "./context/node-file.js";
+export { loadGraphCached } from "./graph/load.js";
+export { resolveContextDir } from "./util/state.js";

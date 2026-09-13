@@ -46,8 +46,8 @@ test('initialize → tools/list → tools/call round-trip', async () => {
   assert.ok(init.result.capabilities.tools);
   assert.equal(init.result.serverInfo.name, 'graft');
   // This dir has no graph and no parent checkout, so the server advertises
-  // nothing: graft is registered at the user MCP scope now (hosts/claude-global.ts),
-  // which starts it in every project the user opens, and six tool schemas charged
+  // nothing: a user-scope registration starts it in every project the user opens,
+  // and six tool schemas charged
   // to a repo that never asked for graft is context spent for answers it cannot
   // give. See `advertised` in src/mcp/server.ts.
   const list = rs.find((r) => r.id === 2);

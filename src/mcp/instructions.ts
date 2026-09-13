@@ -24,6 +24,8 @@
  * 660–984, and nothing proves a longer one survives un-truncated.
  */
 
+import { mcpSteeringEnabled } from '../fork.js';
+
 /** Tool names in the order an agent should reach for them, most-used first. */
 const TOOL_ORDER = [
   'graft_find_code',
@@ -41,8 +43,9 @@ export function toolSearchQuery(prefix = 'mcp__graft__'): string {
 export function mcpInstructions(): string {
   return [
     'This repo is indexed by graft: a prebuilt graph of every symbol, its file:line',
-    'span, and who calls what. Prefer these tools over grep/read — one call usually',
-    'replaces several file reads.',
+    mcpSteeringEnabled()
+      ? 'span, and who calls what. Prefer these tools over grep/read — one call usually replaces several file reads.'
+      : 'span, and who calls what.',
     '',
     `**If these tools are deferred (names shown, schemas withheld), load them all in ONE lookup:** ToolSearch "${toolSearchQuery()}" — one round trip for the whole session. Never load them one at a time.`,
     '',

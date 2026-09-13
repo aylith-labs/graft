@@ -9,7 +9,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -98,16 +98,21 @@ test("A5: deleting the generated graft cache does not delete the persisted inclu
   }
 });
 
-test("A5: custom --dir builds keep repository config outside both output directories", () => {
+test("A5: a --dir outside the repo keeps build config in the graph dir and leaves the repo untouched", () => {
   const d = repoWithBuildDir();
   const out = mkdtempSync(join(tmpdir(), "graft-include-dir-output-"));
   try {
     writeFileSync(join(d, "graft"), "a regular file that must not receive config\n");
+    writeFileSync(join(d, ".gitignore"), "node_modules/\n");
+    const gitignoreBefore = readFileSync(join(d, ".gitignore"), "utf8");
     runCli(["--dir", out, "build", d, "--include-dir", "build"]);
 
     const graph = readGraph(wiringPath(out));
     assert.ok(graph?.nodes.some((n) => n.id === "build/util.ts#fromBuild"));
-    assert.equal(existsSync(join(d, ".graft", "config.json")), true);
+    assert.equal(existsSync(join(out, ".graft", "config.json")), true);
+    assert.equal(existsSync(join(d, ".graft")), false, "nothing is written into the repo");
+    const gitignoreAfter = readFileSync(join(d, ".gitignore"), "utf8");
+    assert.equal(gitignoreAfter, gitignoreBefore, ".gitignore is left alone");
     assert.equal(existsSync(join(d, "graft", ".cache", "config.json")), false);
     assert.equal(existsSync(join(out, ".cache", "config.json")), false);
   } finally {

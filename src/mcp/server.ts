@@ -7,24 +7,6 @@ import { TOOLS, callTool } from './tools.js';
 import { mcpInstructions } from './instructions.js';
 import { hasGraftIndex } from '../graph/root.js';
 import { mainWorktreeRoot } from '../graph/seed.js';
-import { runUpkeep } from '../upkeep-run.js';
-import { runningVersion } from '../upkeep.js';
-import { maybeFlushInBackground, track } from '../telemetry/index.js';
-
-/**
- * MCP tool name → the command enum the telemetry contract knows. A tool absent
- * here is simply not counted: `track` would drop an unlisted command anyway, and
- * mapping by hand keeps the wire vocabulary identical across the CLI and MCP so
- * `ask` means the same thing in both.
- */
-const TOOL_COMMAND: Record<string, string> = {
-  graft_find_code: 'ask',
-  graft_find_all: 'grep',
-  graft_trace_calls: 'callers',
-  graft_file_api: 'skeleton',
-  graft_repo_map: 'map',
-  graft_check_freshness: 'check',
-};
 
 function send(msg: object): void {
   process.stdout.write(`${JSON.stringify(msg)}\n`);
@@ -41,7 +23,7 @@ function replyError(id: unknown, code: number, message: string): void {
 /**
  * Which tools this server admits to having.
  *
- * `hosts/claude-global.ts` registers graft at the *user* MCP scope, which starts this
+ * A user-scope MCP registration starts this
  * server in every project the user opens — including ones that never asked for graft.
  * Six tool schemas is real context, charged on every turn of every session, and in a
  * repo with no graph every one of them can only answer "run graft build". So a repo
@@ -69,23 +51,6 @@ function advertised(root: string, dirOverride?: string): typeof TOOLS {
  * lookup misses. The caller already knows it.
  */
 export function startMcpServer(root: string, dirOverride?: string, version = '0'): void {
-  // The self-maintenance pass, run once at boot. This is the ONLY channel that
-  // reaches hosts with no hook support (Cursor, and any plain MCP client): it
-  // refreshes rule files an older `graft init` wrote, and kicks off the cached
-  // registry check. Both are fail-soft, and the resulting lines ride along in
-  // `instructions` below — stdout is protocol-only, so there is nowhere else to
-  // put them. Never blocks: the registry fetch happens in a detached child.
-  const upkeep = runUpkeep(root, runningVersion()).lines;
-  for (const line of upkeep) console.error(line);
-  // Same deal for the telemetry queue: flushed from a detached child at boot, so
-  // a Cursor user who never touches the CLI still gets their events out.
-  //
-  // Deliberately NOT the first-run notice. This server's stderr goes to an editor
-  // log nobody reads, so printing it here would mark the disclosure as shown
-  // without anyone having seen it. It stays pending for the next CLI command,
-  // and `graft init`'s picker is the channel that reached this user already.
-  maybeFlushInBackground();
-
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   rl.on('line', (line) => {
     const text = line.trim();
@@ -106,7 +71,7 @@ export function startMcpServer(root: string, dirOverride?: string, version = '0'
           capabilities: { tools: {} },
           serverInfo: { name: 'graft', version },
           // The one channel that survives tool deferral — see ./instructions.ts.
-          instructions: upkeep.length ? `${upkeep.join('\n')}\n\n${mcpInstructions()}` : mcpInstructions(),
+          instructions: mcpInstructions(),
         });
         return;
       case 'notifications/initialized':
@@ -130,13 +95,6 @@ export function startMcpServer(root: string, dirOverride?: string, version = '0'
         // than an unhandled rejection that kills the server.
         callTool(root, name, args, dirOverride).then(
           (r) => {
-            // No `hit`: `isError` means the tool failed, which is not the same
-            // question as "did the graph have an answer". Absent beats wrong.
-            // hasOwn for the same reason as track()'s: a client is free to send
-            // `{"name":"constructor"}`, and a plain lookup would hand `track` a
-            // function rather than undefined.
-            const command = Object.hasOwn(TOOL_COMMAND, name) ? TOOL_COMMAND[name] : undefined;
-            track('query', { command, surface: 'mcp' }, { repo: root, host: 'mcp' });
             reply(id, { content: [{ type: 'text', text: r.text }], isError: r.isError });
           },
           (err) => replyError(id, -32603, err instanceof Error ? err.message : String(err)),

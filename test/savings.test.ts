@@ -4,9 +4,20 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { savingsFor, savingsLine, withSavings, toTokens, setInputRate } from '../src/context/savings.js';
-import { hasSavingsTally } from '../src/claude/tally.js';
+import { savingsFor, savingsLine, withSavings, toTokens } from '../src/context/savings.js';
 import type { GraphV1, NodeV1 } from '../src/graph/types.js';
+
+function withFooter<T>(value: string | undefined, run: () => T): T {
+  const previous = process.env.GRAFT_FORK_SAVINGS_FOOTER;
+  if (value === undefined) delete process.env.GRAFT_FORK_SAVINGS_FOOTER;
+  else process.env.GRAFT_FORK_SAVINGS_FOOTER = value;
+  try {
+    return run();
+  } finally {
+    if (previous === undefined) delete process.env.GRAFT_FORK_SAVINGS_FOOTER;
+    else process.env.GRAFT_FORK_SAVINGS_FOOTER = previous;
+  }
+}
 
 function fileNode(path: string, chars?: number): NodeV1 {
   return {
@@ -43,81 +54,47 @@ test('savingsFor: skips files with no known size, returns undefined when none ar
   assert.equal(savingsFor(g, ['missing.ts']), undefined);
 });
 
+test('savingsLine: off by default, so no output carries a savings claim', () => {
+  withFooter(undefined, () => {
+    assert.equal(savingsLine('x'.repeat(40), { files: 2, baselineChars: 8000 }), '');
+    assert.equal(withSavings('body', { files: 2, baselineChars: 8000 }), 'body');
+  });
+});
+
 test('savingsLine: reports saved tokens and percent when the output is smaller', () => {
-  const body = 'x'.repeat(40); // ≈ 10 tok
-  const footer = savingsLine(body, { files: 2, baselineChars: 8000 }); // baseline ≈ 2000 tok
-  assert.match(footer, /tokens saved ≈ [\d,]+ \(\d+%\)/);
-  assert.match(footer, /2 file\(s\)/);
-  const base = toTokens(8000);
-  assert.ok(footer.includes((base - toTokens(body.length)).toLocaleString()));
-  // The nudge rides along so the agent reports the turn total without SKILL.md.
-  assert.match(footer, /end of your reply/i);
-  assert.match(footer, /graft saved ~N tokens this turn/);
-  // The nudge must NOT introduce a second "[graft] tokens saved ≈ <n>" token —
-  // the PostToolUse accumulator sums every such match, so a stray one double-counts.
-  assert.equal((footer.match(/\[graft\] tokens saved ≈ [\d,]+/g) ?? []).length, 1);
+  withFooter('1', () => {
+    const body = 'x'.repeat(40); // ≈ 10 tok
+    const footer = savingsLine(body, { files: 2, baselineChars: 8000 }); // baseline ≈ 2000 tok
+    assert.match(footer, /tokens saved ≈ [\d,]+ \(\d+%\)/);
+    assert.match(footer, /2 file\(s\)/);
+    const base = toTokens(8000);
+    assert.ok(footer.includes((base - toTokens(body.length)).toLocaleString()));
+    assert.doesNotMatch(footer, /end of your reply/i, 'no instruction to the agent rides along');
+    assert.equal((footer.match(/\[graft\] tokens saved ≈ [\d,]+/g) ?? []).length, 1);
+  });
 });
 
 test('savingsLine: stays silent when there is nothing honest to claim', () => {
-  assert.equal(savingsLine('anything', undefined), '');
-  assert.equal(savingsLine('anything', { files: 1, baselineChars: 0 }), '');
-  // Baseline no bigger than the output itself (tiny file) → no claim.
-  assert.equal(savingsLine('x'.repeat(1000), { files: 1, baselineChars: 40 }), '');
+  withFooter('1', () => {
+    assert.equal(savingsLine('anything', undefined), '');
+    assert.equal(savingsLine('anything', { files: 1, baselineChars: 0 }), '');
+    // Baseline no bigger than the output itself (tiny file) → no claim.
+    assert.equal(savingsLine('x'.repeat(1000), { files: 1, baselineChars: 40 }), '');
+  });
 });
 
 test('withSavings: puts the line on top so `head -N` and host truncation keep it', () => {
-  const body = 'line1\nline2\nline3';
-  const out = withSavings(body, { files: 2, baselineChars: 8000 });
-  const first = out.split('\n')[0];
-  assert.match(first, /^\[graft\] tokens saved ≈ [\d,]+/);
-  assert.ok(out.endsWith(body), 'body follows the header verbatim');
-  // Exactly one number in the whole output — a second copy would be
-  // double-counted by the PostToolUse accumulator's matchAll.
-  assert.equal((out.match(/\[graft\] tokens saved ≈ [\d,]+/g) ?? []).length, 1);
+  withFooter('1', () => {
+    const body = 'line1\nline2\nline3';
+    const out = withSavings(body, { files: 2, baselineChars: 8000 });
+    const first = out.split('\n')[0];
+    assert.match(first, /^\[graft\] tokens saved ≈ [\d,]+/);
+    assert.ok(out.endsWith(body), 'body follows the header verbatim');
+  });
 });
 
 test('withSavings: returns the body untouched when there is nothing to claim', () => {
-  assert.equal(withSavings('body', undefined), 'body');
-});
-
-test('the turn nudge carries no dollar figure until a rate is set', () => {
-  setInputRate(null);
-  const footer = savingsLine('body', { files: 2, baselineChars: 8000 });
-  assert.match(footer, /graft saved ~N tokens this turn/);
-  assert.doesNotMatch(footer, /\$/, 'no rate measured, so nothing is priced');
-});
-
-test('the turn nudge prices this call once a rate is set', () => {
-  // $5/Mtok: a 1,000-token saving is worth half a cent, which must read as
-  // "<$0.01" rather than "$0.00" — see formatDollars.
-  setInputRate(5);
-  const footer = savingsLine('x'.repeat(400), { files: 2, baselineChars: 8000 });
-  assert.match(footer, /worth <\$0\.01/);
-  assert.match(footer, /~\$X.*this turn/, 'the example shows the dollar-bearing form');
-  setInputRate(null);
-});
-
-test('a priced nudge still leaves exactly one number for the accumulator', () => {
-  // The nudge must never grow a second `[graft] tokens saved ≈ <n>` — the
-  // PostToolUse accumulator sums every match, so an example carrying the
-  // pattern would double-count the call.
-  setInputRate(5);
-  const footer = savingsLine('x'.repeat(400), { files: 2, baselineChars: 8000 });
-  assert.equal((footer.match(/\[graft\] tokens saved ≈ [\d,]+/g) ?? []).length, 1);
-  setInputRate(null);
-});
-
-test('a priced nudge still matches the reported-turns tally regex', () => {
-  // Adding money to the example must not quietly zero `reportedTurns`, which
-  // measures whether the agent told the user anything at all.
-  assert.equal(hasSavingsTally('🌱 graft saved ~12,400 tokens (~$0.04) this turn'), true);
-});
-
-test('setInputRate refuses a rate that would render as $NaN', () => {
-  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
-    setInputRate(bad);
-    const footer = savingsLine('x'.repeat(400), { files: 2, baselineChars: 8000 });
-    assert.doesNotMatch(footer, /\$/, `rate ${bad} must price nothing`);
-  }
-  setInputRate(null);
+  withFooter('1', () => {
+    assert.equal(withSavings('body', undefined), 'body');
+  });
 });

@@ -6,7 +6,7 @@
  *
  * @example
  * ```ts
- * import { Graft } from "@nanonets/graft";
+ * import { Graft } from "@aylith/graft";
  *
  * const engine = new Graft();
  * await engine.init(".");             // writes .context/*.md + manifest.json

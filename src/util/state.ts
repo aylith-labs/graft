@@ -2,15 +2,11 @@
  * The `graft/.cache/` sidecar state: the statusline's stats snapshot and the
  * build lock that serializes rebuilds.
  *
- * Lives in `util/` rather than `claude/` because two very different callers need
- * it: the Claude Code hooks (which flip `dirty` on an edit and clear it after a
- * background sync) and the graph's own pre-query auto-refresh
- * (`graph/refresh.ts`), which must take the same lock so the two never rebuild
- * on top of each other. `claude/state.ts` re-exports all of this, so nothing
- * outside had to change when it moved.
+ * The graph's pre-query auto-refresh (`graph/refresh.ts`) takes the lock so two
+ * refreshes never rebuild on top of each other.
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
-import { join, dirname, isAbsolute } from 'node:path';
+import { join, dirname, isAbsolute, relative } from 'node:path';
 
 export interface Stats {
   nodeCount: number; edgeCount: number; languages: string[];
@@ -29,16 +25,9 @@ export function emptyStats(): Stats {
 const LOCK_FILE = '.sync.lock';
 
 /**
- * Where the pieces this module manages (the stats cache, the sync lock,
- * per-session state, the upkeep stamp) actually live when no caller-supplied
- * override is available. The Claude Code hooks, `sync-run`, the statusline,
- * and `upkeep` all resolve a bare project dir and never see an explicit
- * `--dir` — unlike a direct CLI invocation, which threads one through
- * `contextDirFor` (`context/node-file.ts`). This mirrors that same override
- * precedence for those entry points: `GRAFT_DIR` wins over the default
- * `<projectDir>/graft`, the same env var `resolveConfig` already honors for
- * the `--deep` LLM path. A relative `GRAFT_DIR` resolves against `projectDir`
- * so it holds regardless of the caller's cwd.
+ * Where the stats cache, the sync lock and the build config live for callers that
+ * only know the project dir: `GRAFT_DIR` wins over the default `<projectDir>/graft`
+ * (the CLI exports `--dir` into it), and a relative value resolves against `projectDir`.
  */
 export function resolveContextDir(projectDir: string): string {
   const override = process.env.GRAFT_DIR;
@@ -102,11 +91,6 @@ export interface BuildConfig {
    * checkout someone parked in the tree. Absent/false keeps the historical
    * boundary. */
   followNestedRepos?: boolean;
-  /** The Trail brain this repo's rules come from: the brain id and the token to
-   * read it with. Persisted here — in the git-ignored `.graft/` — rather than in
-   * `~/.graft/`, because a brain belongs to one repository and two checkouts on
-   * one machine must not share one. `undefined` clears it. */
-  brain?: { brainId: string; token: string; baseUrl?: string };
 }
 
 /** Local, Git-ignored repository configuration. Kept outside generated
@@ -114,7 +98,16 @@ export interface BuildConfig {
  * custom `--dir` builds cannot erase or redirect the persisted choice. */
 export const BUILD_CONFIG_DIR = '.graft';
 
-export function buildConfigPath(d: string): string { return join(d, BUILD_CONFIG_DIR, 'config.json'); }
+/** Inside the graph dir when that lives outside the repo, so an external graph leaves the repo untouched. */
+export function buildConfigPath(d: string): string {
+  const contextDir = resolveContextDir(d);
+  return join(isOutside(d, contextDir) ? contextDir : d, BUILD_CONFIG_DIR, 'config.json');
+}
+
+function isOutside(root: string, dir: string): boolean {
+  const rel = relative(root, dir);
+  return rel.startsWith('..') || isAbsolute(rel);
+}
 
 /** Keep local build configuration out of Git without coupling it to the
  * generated graph directory. Best-effort, matching graph-cache ignore setup. */
@@ -134,7 +127,7 @@ function ensureBuildConfigIgnored(d: string): void {
 
 export function readBuildConfig(d: string): BuildConfig | null { return readJson<BuildConfig>(buildConfigPath(d)); }
 export function writeBuildConfig(d: string, c: BuildConfig): void {
-  ensureBuildConfigIgnored(d);
+  if (!isOutside(d, resolveContextDir(d))) ensureBuildConfigIgnored(d);
   writeJsonAtomic(buildConfigPath(d), c);
 }
 

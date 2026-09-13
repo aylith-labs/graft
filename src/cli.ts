@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 /**
  * `graft` CLI. Commands: build, ask, check, viz, mcp, callers, skeleton, grep,
- * map, init. Git is the sync: commit graft/ and a clone has the graph. A
- * workspace parent (≥2 git children) federates query commands across children.
+ * map, blast. A workspace parent (≥2 git children) federates query commands
+ * across children.
  */
-import "dotenv/config";
 import { Command } from "commander";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,22 +12,12 @@ import { resolveConfig, type EngineConfig } from "./ai/providers.js";
 import type { ProviderKind } from "./ai/llm/factory.js";
 import { formatCheckReport } from "./context/check.js";
 import { formatGraphCheckReport } from "./graph/check.js";
-import { buildGraphIfMissing, runInit } from "./claude/init.js";
-import { statuslineWanted } from "./claude/settings-merge.js";
-import { runHostsInit } from "./hosts/init.js";
-import { hostIds } from "./hosts/registry.js";
-import { parseBrainArg, connectBrain, pullBrain, brainStatus } from "./brain/connect.js";
-import { rulesForPointers } from "./brain/attach.js";
-import { clearLink, type BrainLink } from "./brain/link.js";
-import { buildLocalDigest, fetchExpectedRepo, pushDigest, repoSlugFromGit, sameRepo } from "./brain/push.js";
-import { readLink } from "./brain/link.js";
 import { contextDirFor } from "./context/node-file.js";
 import { loadGraphCached } from "./graph/load.js";
 import { ensureFreshChildren, ensureFreshGraph, refreshNote } from "./graph/refresh.js";
 import { isWorkspaceBuildRoot, readWorkspace } from "./graph/workspace.js";
 import { nearestGraftRoot } from "./graph/root.js";
 import { unsupportedExtensions, supportedExtensions } from "./graph/source-files.js";
-import { discoverWorkspaceChildren } from "./graph/scopes.js";
 import {
   runWorkspaceAsk,
   runWorkspaceBuild,
@@ -37,63 +26,12 @@ import {
   runWorkspaceGrep,
   runWorkspaceMap,
 } from "./graph/workspace-cli.js";
-import { formatInitEpilogue } from "./cli-epilogue.js";
-import { planInit, selectedWrites } from "./hosts/plan.js";
-import { planRetract, runRetract, changed, type Retraction } from "./hosts/retract.js";
-import { formatNonInteractiveHelp, formatPlan, runPicker } from "./cli-picker.js";
-import { homedir } from "node:os";
-import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, runUpgrade } from "./cli-meta.js";
+import { readCurrentVersion } from "./cli-meta.js";
 import { patchBuildConfig, type BuildConfig } from "./util/state.js";
 import { normalizePathPrefix } from "./util/paths.js";
-import { latestSession, formatSessionStats, sessionInputRate } from "./claude/session-metrics.js";
-import { setInputRate } from "./context/savings.js";
-import { formatUpdateNudge, maybeRefreshInBackground, readUpdateCache, refreshUpdateCache, writeStamp } from "./upkeep.js";
-import {
-  errorCode,
-  filesBucket,
-  durationBucket,
-  formatDebug,
-  formatStatus,
-  firstRunNotice,
-  isTrackedCommand,
-  langsValue,
-  offReason,
-  maybeFlushInBackground,
-  patchState,
-  runFlush,
-  track,
-  trackFirstRunIfNew,
-} from "./telemetry/index.js";
 
 const program = new Command();
 const currentVersion = readCurrentVersion(import.meta.url);
-
-/**
- * What the `query` telemetry event will say, filled in by the command as it runs
- * and emitted once from the `postAction` hook below.
- *
- * A module-level slot rather than a threaded parameter because the repo root is
- * resolved deep inside each action (`queryRoot`) while the event is emitted
- * centrally — and because a command that calls `process.exit` should simply
- * report nothing, which falls out of never emitting until postAction.
- */
-let queryNote: { repo?: string; hit?: "yes" | "no" } = {};
-
-/** Record the repo a query ran against, and pass it straight through so call
- *  sites stay one line. */
-function noteQuery(dir: string): string {
-  queryNote.repo = dir;
-  // Every retrieval command funnels through here, which makes it the one place
-  // that can price this session's tokens before a formatter needs the number.
-  setInputRate(sessionInputRate(dir));
-  return dir;
-}
-
-/** Whether a query found anything. Only the commands that have a result count in
- *  hand call this; the property is simply absent for the others. */
-function noteHit(found: boolean): void {
-  queryNote.hit = found ? "yes" : "no";
-}
 
 program
   .name("graft")
@@ -203,120 +141,11 @@ function parseTabs(raw: string | undefined): VizTab[] | undefined {
   return want as VizTab[];
 }
 
-/**
- * Commands that own the upgrade story themselves (`version`, `upgrade`) or must
- * not editorialize on stderr at startup (`mcp` runs its own upkeep at boot, and
- * `_update-check` IS the fetch).
- */
-const UPKEEP_SKIP = new Set(["version", "upgrade", "_update-check", "_brain-refresh", "mcp"]);
-
-/**
- * Every other command: top up the cached registry answer in the background and,
- * if a newer graft is out, say so once on stderr. This is what makes the CLI the
- * cache filler for the hooks, which are not allowed to touch the network.
- */
-program.hook("preAction", (_parent, action) => {
-  if (UPKEEP_SKIP.has(action.name())) return;
-  maybeRefreshInBackground();
-  const nudge = formatUpdateNudge(currentVersion, readUpdateCache()?.latest);
-  if (nudge) console.error(nudge);
-  // Telemetry, in the order a user should experience it: disclose first, then
-  // record, then (at most once a day, detached) send. Every step is a no-op in a
-  // fork, in CI, under DO_NOT_TRACK, or after `graft telemetry disable`.
-  const notice = firstRunNotice();
-  if (notice) console.error(notice);
-  trackFirstRunIfNew();
-  maybeFlushInBackground();
+/** `--dir` reaches the modules that resolve the graph dir from the environment (build config, lock). */
+program.hook("preAction", () => {
+  const dir = program.opts<GlobalOpts>().dir;
+  if (dir) process.env.GRAFT_DIR = resolve(dir);
 });
-
-/**
- * The `query` event, emitted after the command rather than before it, so it can
- * carry what the query actually did. A command that exits early via
- * `process.exit` never reaches here and is simply not counted — under-reporting
- * is the right failure mode for a metric.
- */
-program.hook("postAction", (_parent, action) => {
-  const name = action.name();
-  if (!isTrackedCommand(name)) return;
-  track("query", { command: name, surface: "cli", hit: queryNote.hit }, { repo: queryNote.repo });
-});
-
-// Hidden from --help: only ever spawned detached by maybeRefreshInBackground.
-program
-  .command("_brain-refresh", { hidden: true })
-  .description("internal: re-pull the attached brain's rules and rewrite the agent files")
-  .argument("[dir]", "target repo directory", ".")
-  .action(async (dir: string) => {
-    // Spawned detached by upkeep, so nothing here is user-visible and nothing
-    // may throw: a failure means the cached rules keep serving, which is the
-    // correct outcome for a brain that is momentarily unreachable.
-    try {
-      await pullBrain(resolve(dir), { home: homedir() });
-    } catch {
-      /* the next session tries again */
-    }
-  });
-
-program
-  .command("_update-check", { hidden: true })
-  .description("internal: refresh the cached latest-version answer")
-  .action(() => {
-    refreshUpdateCache();
-  });
-
-// Hidden for the same reason as _update-check: only ever spawned detached, by
-// maybeFlushInBackground. Running it by hand is harmless — it drains the queue.
-program
-  .command("_telemetry-flush", { hidden: true })
-  .description("internal: POST the queued anonymous usage events")
-  .action(async () => {
-    await runFlush();
-  });
-
-program
-  .command("telemetry")
-  .description("Show, inspect, or turn off the anonymous usage stats (see TELEMETRY.md)")
-  .argument("[action]", "status (default) | enable | disable | debug", "status")
-  .action((action: string) => {
-    switch (action) {
-      case "status":
-        console.log(formatStatus());
-        return;
-      case "enable":
-        patchState({ enabled: true });
-        console.log("telemetry: on — anonymous, aggregate-only. `graft telemetry status` for details.");
-        return;
-      case "disable":
-        // Also stamp the notice as shown: someone who has just opted out should
-        // not be told about telemetry again the next time they run a command.
-        patchState({ enabled: false, noticeShownAt: new Date().toISOString() });
-        console.log("telemetry: off. Nothing further will be recorded or sent.");
-        return;
-      case "debug":
-        console.log(formatDebug());
-        return;
-      default:
-        console.error(`✗ unknown action "${action}" — expected status, enable, disable, or debug`);
-        process.exit(1);
-    }
-  });
-
-program
-  .command("version")
-  .description("Print the installed version and the latest published on npm")
-  .action(() => {
-    const latest = getNpmViewVersion();
-    console.log(formatVersionReport(currentVersion, latest));
-  });
-
-program
-  .command("upgrade")
-  .description("Upgrade the globally installed graft to the latest version on npm")
-  .action(() => {
-    const result = runUpgrade(import.meta.url);
-    console.log(formatUpgradeReport(result));
-    if (result.ran && !result.ok) process.exit(1);
-  });
 
 program
   .command("build")
@@ -383,7 +212,6 @@ program
     },
     command: Command,
   ) => {
-    const buildStartedAt = Date.now();
     if (opts.gitignore === false) process.env.GRAFT_NO_GITIGNORE = "1";
     if (opts.ignore === false) process.env.GRAFT_NO_IGNORE = "1";
     const concurrency = opts.concurrency ? Math.max(1, Number(opts.concurrency)) : undefined;
@@ -494,10 +322,6 @@ program
           process.stderr.write(
             `\r${phase === "summarize" ? "reading" : "writing"} concepts ${index + 1}/${total}: ${file.slice(0, 40).padEnd(40)}`,
           ),
-      }).catch((err: unknown) => {
-        // Only the stage and a code enum; the message stays on this machine.
-        track("build_failed", { stage: "summarize", code: errorCode(err) }, { repo: buildRoot });
-        throw err;
       });
       process.stderr.write("\n");
       console.log(
@@ -519,9 +343,6 @@ program
         process.stderr.write(
           `\r${phase === "enrich" ? "summarizing" : "parsing"} ${index + 1}/${total}: ${file.slice(0, 50).padEnd(50)}`,
         ),
-    }).catch((err: unknown) => {
-      track("build_failed", { stage: "graph", code: errorCode(err) }, { repo: buildRoot });
-      throw err;
     });
     process.stderr.write("\n");
     console.log(`✓ wiring: ${g.nodes} nodes (${fmt(g.byKind)}), ${g.edges} edges, ${g.cards} cards [${g.languages.join(", ")}]`);
@@ -533,19 +354,6 @@ program
       console.log(`  meaning: ${m.computed} computed, ${m.cached} cached, ${m.stale} stale, ${m.pending} pending`);
     }
     console.log(`  → ${g.contextDir}`);
-    // The activation event. Everything here is a bucket or a fixed label: repo
-    // scale rather than a file count, a language set rather than file names.
-    track(
-      "build_completed",
-      {
-        files_bucket: filesBucket(g.files),
-        langs: langsValue(g.languages),
-        mode: deep ? "deep" : "fast",
-        duration_bucket: durationBucket(Date.now() - buildStartedAt),
-        incremental: String(g.reused > 0),
-      },
-      { repo: buildRoot },
-    );
     for (const e of g.errors) console.error(`✗ ${e}`);
 
     const rel = relative(process.cwd(), g.contextDir) || "graft";
@@ -600,7 +408,7 @@ program
   .option("--no-graph-rank", "rank by lexical relevance only, without the graph-connectivity re-rank (ablation/eval)")
   .option(...NO_REFRESH_FLAG)
   .action(async (query: string, dirArg: string | undefined, opts: { limit: string; source?: boolean; full?: boolean; in?: string; json?: boolean; refresh?: boolean; graphRank?: boolean }) => {
-    const dir = noteQuery(queryRoot(dirArg));
+    const dir = queryRoot(dirArg);
     await refreshBefore(dir, opts);
     const askGlobalDir = program.opts<GlobalOpts>().dir;
     if (readWorkspace(dir, askGlobalDir)) {
@@ -618,7 +426,6 @@ program
       process.exit(1);
       return;
     }
-    noteHit(r.hits.length > 0);
     if (opts.json) {
       console.log(JSON.stringify(r, null, 2));
     } else {
@@ -635,7 +442,7 @@ program
   .option("--json", "output the result as JSON")
   .option(...NO_REFRESH_FLAG)
   .action(async (file: string, dirArg: string | undefined, opts: { json?: boolean; refresh?: boolean }) => {
-    const dir = noteQuery(queryRoot(dirArg));
+    const dir = queryRoot(dirArg);
     await refreshBefore(dir, opts);
     const { skeleton, formatSkeleton } = await import("./ask/ask.js");
     const globalOpts = program.opts<{ dir?: string }>();
@@ -652,7 +459,7 @@ program
   .option("--json", "output the drift as JSON")
   .action(async (dirArg: string | undefined, opts: { extensions?: string[]; json?: boolean }) => {
     warnUnsupportedExtensions(opts.extensions);
-    const dir = noteQuery(queryRoot(dirArg));
+    const dir = queryRoot(dirArg);
     const checkGlobalDir = program.opts<GlobalOpts>().dir;
     if (readWorkspace(dir, checkGlobalDir)) {
       await runWorkspaceCheck(dir, checkGlobalDir);
@@ -687,24 +494,6 @@ program
   });
 
 program
-  .command("stats")
-  .description("Show this agent session's graft-vs-source usage mix and tokens saved")
-  .argument(...DIR_ARG)
-  .option("--json", "output the session stats as JSON")
-  .action((dirArg: string | undefined, opts: { json?: boolean }) => {
-    // Reads local session JSON only — no graph, no network. This is how a Cursor
-    // user (no statusline) sees the numbers the Claude Code bar would show, and it
-    // works under DO_NOT_TRACK because it never touches telemetry.
-    const dir = queryRoot(dirArg);
-    const s = latestSession(dir);
-    if (opts.json) {
-      console.log(JSON.stringify(s, null, 2));
-      return;
-    }
-    console.log(formatSessionStats(s));
-  });
-
-program
   .command("viz")
   .description("Serve an interactive visualization of the context graph (and graph.json when present)")
   .argument(...DIR_ARG)
@@ -718,7 +507,7 @@ program
     // in the command the caller just typed, and telling them to go build an index
     // first sends them off to fix the wrong thing.
     const tabs = parseTabs(opts.tabs);
-    const dir = noteQuery(queryRoot(dirArg));
+    const dir = queryRoot(dirArg);
     const { existsSync } = await import("node:fs");
     const { resolve, basename } = await import("node:path");
     const { spawn } = await import("node:child_process");
@@ -770,7 +559,7 @@ program
   .description("Serve the graph over MCP (stdio) — exposes graft_find_code, graft_trace_calls, graft_find_all, graft_file_api, graft_repo_map and graft_check_freshness as tools")
   .argument(...DIR_ARG)
   .action(async (dirArg: string | undefined) => {
-    const dir = noteQuery(queryRoot(dirArg));
+    const dir = queryRoot(dirArg);
     const { startMcpServer } = await import("./mcp/server.js");
     const globalOpts = program.opts<{ dir?: string }>();
     startMcpServer(dir, globalOpts.dir, currentVersion);
@@ -794,7 +583,7 @@ program
       dirArg: string | undefined,
       opts: { direction?: string; depth?: string; in?: string; json?: boolean; refresh?: boolean },
     ) => {
-      const dir = noteQuery(queryRoot(dirArg));
+      const dir = queryRoot(dirArg);
       await refreshBefore(dir, opts);
       const globalOpts = program.opts<{ dir?: string }>();
       if (!opts.json && readWorkspace(dir, globalOpts.dir)) {
@@ -835,7 +624,7 @@ program
   .option("--pr-author <who...>", "GitHub login, git name or email of the PR author, so they are left out of their own suggestions")
   .option(...NO_REFRESH_FLAG)
   .action(async (dirArg: string | undefined, opts: { base?: string; depth?: string; format?: string; name?: boolean; exportViz?: string; title?: string; owners?: boolean; prAuthor?: string[]; refresh?: boolean }) => {
-    const dir = noteQuery(queryRoot(dirArg));
+    const dir = queryRoot(dirArg);
     await refreshBefore(dir, opts);
     const { runBlastCommand } = await import("./blast/blast-cli.js");
     await runBlastCommand(dir, {
@@ -867,7 +656,7 @@ program
       dirArg: string | undefined,
       opts: { ignoreCase?: boolean; fixed?: boolean; in?: string; json?: boolean; refresh?: boolean },
     ) => {
-      const dir = noteQuery(queryRoot(dirArg));
+      const dir = queryRoot(dirArg);
       await refreshBefore(dir, opts);
       const globalOpts = program.opts<{ dir?: string }>();
       if (readWorkspace(dir, globalOpts.dir)) {
@@ -897,7 +686,7 @@ program
   .option("--json", "output as JSON")
   .option(...NO_REFRESH_FLAG)
   .action(async (dirArg: string | undefined, opts: { json?: boolean; maxDirs?: string; refresh?: boolean }) => {
-    const dir = noteQuery(queryRoot(dirArg));
+    const dir = queryRoot(dirArg);
     const root = resolve(dir);
     const globalOpts = program.opts<{ dir?: string }>();
     let maxDirsW: number | undefined;
@@ -929,475 +718,6 @@ program
       return;
     }
     process.stdout.write(formatRepoMap(map));
-  });
-
-program
-  .command("init")
-  .description("Wire Graft into the AI coding agents used with this repo (instruction files + MCP server; full hooks + statusline + MCP for Claude Code)")
-  .argument("[dir]", "target repo directory", ".")
-  .option("--no-build", "skip building the graph (wire files only)")
-  .option("--agents <ids...>", `only these agents (${hostIds().join(", ")}, claude)`)
-  .option("--all-agents", "write instruction files for every known agent, detected or not")
-  .option("--no-agents", "Claude Code wiring only; skip other agents")
-  .option("--list-agents", "list known agent ids and exit")
-  .option("--no-mcp", "skip MCP server registration for other agents")
-  .option("--no-hooks", "skip hook installation for other agents")
-  .option("--no-statusline", "skip writing Claude Code statusLine (keep a user-defined one)")
-  .option("--dry-run", "print every file init would touch, then exit without writing")
-  .option("-y, --yes", "skip the picker and wire every detected agent (the pre-0.8 default)")
-  .option("--no-global", "skip writes outside this repo (the ~/.codex/ config + hooks)")
-  .option("--brain <handoff>", "attach a Trail brain: <brainId>:<token> (or a bare brain id with GRAFT_BRAIN_TOKEN set)")
-  .action(async (dir: string, opts: { build?: boolean; agents?: string[]; allAgents?: boolean; listAgents?: boolean; mcp?: boolean; hooks?: boolean; statusline?: boolean; dryRun?: boolean; yes?: boolean; global?: boolean; brain?: string }) => {
-    if (opts.listAgents) {
-      for (const id of [...hostIds(), "claude"]) console.log(id);
-      return;
-    }
-    // Parsed before anything is written: a mistyped handoff should cost the user
-    // an error, not a half-wired repo they have to `graft uninstall` out of.
-    let brainLink: BrainLink | undefined;
-    if (opts.brain) {
-      const parsed = parseBrainArg(opts.brain);
-      if ("error" in parsed) {
-        console.error(`✗ --brain: ${parsed.error}`);
-        process.exitCode = 1;
-        return;
-      }
-      brainLink = parsed;
-    }
-    const repo = resolve(dir);
-    const explicit = Array.isArray(opts.agents) ? opts.agents : undefined;
-
-    if (explicit) {
-      const validIds = [...hostIds(), "claude"];
-      const unknown = explicit.filter((id) => !validIds.includes(id));
-      if (unknown.length) {
-        console.error(`✗ unknown agent id(s): ${unknown.join(", ")} — valid: ${validIds.join(", ")}`);
-        process.exit(1);
-      }
-    }
-
-    // Which agents to wire, decided before anything is written. Explicit flags
-    // win; otherwise prompt on a TTY, and on a pipe write nothing rather than
-    // guessing (pre-0.8 this silently wired every agent the machine had ever
-    // installed — see --yes to get that back).
-    const home = homedir();
-    const plan = planInit(repo, { home });
-    const detectedIds = plan.filter((p) => p.detected).map((p) => p.id);
-    const noAgents = (opts as { agents?: unknown }).agents === false;
-
-    let ids: string[];
-    // The consent answer from the picker. Undefined everywhere else — a scripted
-    // or flag-driven init never asked, so it must not silently answer.
-    let consent: boolean | undefined;
-    if (explicit) ids = explicit;
-    else if (opts.allAgents) ids = plan.map((p) => p.id);
-    else if (noAgents) ids = ["claude"];
-    else if (opts.yes || opts.dryRun) ids = detectedIds;
-    else if (process.stdin.isTTY && process.stderr.isTTY) {
-      // Only offer the row when telemetry could actually run. `disabled` still
-      // counts: someone who turned it off should be able to turn it back on here.
-      const reason = offReason();
-      const picked = await runPicker(plan, repo, home, {
-        offerTelemetry: reason === null || reason === "disabled",
-      });
-      if (picked === null) {
-        console.error("· cancelled — nothing written");
-        return;
-      }
-      ids = picked.hosts;
-      consent = picked.telemetry;
-    } else {
-      console.error(formatNonInteractiveHelp(detectedIds));
-      return;
-    }
-
-    // The picker's answer, recorded before anything is wired: a user who
-    // unchecked the row must not have this run's init_completed sent.
-    if (consent !== undefined) {
-      patchState({ enabled: consent, noticeShownAt: new Date().toISOString() });
-    }
-
-    // Workspace parent: every child repo gets its OWN wiring too. A session
-    // opens at a repo root, not at the parent, and reads `.claude/` from there —
-    // wiring only the parent leaves each child with no skill, hooks, or MCP.
-    // The parent's own wiring stays (queries there federate across children).
-    const children = isWorkspaceBuildRoot(repo, program.opts<GlobalOpts>().dir)
-      ? discoverWorkspaceChildren(repo)
-      : [];
-    // Parent FIRST: its build is the workspace build, which builds every child's
-    // graph, so each child's own `buildGraphIfMissing` then finds one and no-ops.
-    const targets = [repo, ...children.map((c) => join(repo, c))];
-
-    if (opts.dryRun) {
-      console.error(formatPlan(plan, ids, repo, home));
-      for (const child of children)
-        console.error(`\n— ${child}/ (workspace child)\n` + formatPlan(planInit(join(repo, child), { home }), ids, join(repo, child), home));
-      return;
-    }
-    if (ids.length === 0) {
-      console.error("· no agents selected — nothing written");
-      return;
-    }
-
-    const wantClaude = ids.includes("claude");
-    const cliPath = fileURLToPath(import.meta.url);
-
-    if (children.length)
-      console.error(`· workspace: wiring ${repo} and ${children.length} child repo(s) — ${children.join(", ")}`);
-
-    for (const target of targets) {
-      if (target !== repo) console.error(`\n— ${relative(repo, target)}/`);
-      wireTarget(target, ids, { home, cliPath, plan, opts, wantClaude });
-    }
-
-    // The brain comes last, after the graph exists: its rules are anchored to
-    // symbols, and `graft brain status` can only report how many of them resolve
-    // once there is a graph to resolve them against.
-    if (brainLink) {
-      const res = await connectBrain(repo, brainLink, { home, ids });
-      if (res.warning) console.error(`⚠ brain: ${res.warning}`);
-      else console.error(`✓ brain: pulled ${res.ruleCount} rule(s) from ${brainLink.brainId}`);
-      for (const w of res.writes) console.error(`✓ brain rules: ${w.path} (${w.action})`);
-      if (res.ruleCount > 0 && res.writes.length === 0)
-        console.error("· no instruction file to write rules into — graft ask still carries them");
-    }
-
-    // One epilogue for the whole run. A workspace parent holds no nodes of its
-    // own, so the totals come from the children — the graph the user actually got.
-    const globalDir = program.opts<GlobalOpts>().dir;
-    const graphs = (children.length ? children.map((c) => join(repo, c)) : [repo])
-      .map((d) => loadGraphCached(contextDirFor(d, children.length ? undefined : globalDir)))
-      .filter((g): g is NonNullable<typeof g> => g !== null);
-    console.error(
-      "\n" +
-        formatInitEpilogue({
-          graphBuilt: graphs.length > 0,
-          nodes: graphs.reduce((n, g) => n + g.meta.nodeCount, 0),
-          edges: graphs.reduce((n, g) => n + g.meta.edgeCount, 0),
-        }),
-    );
-    // Sorted so `claude,cursor` and `cursor,claude` aggregate as one value.
-    track(
-      "init_completed",
-      { agents: [...ids].sort().join(","), consent: consent === undefined ? "unasked" : String(consent) },
-      { repo },
-    );
-  });
-
-/** One repo's worth of `init` writes — the parent, then each workspace child. */
-function wireTarget(
-  repo: string,
-  ids: string[],
-  ctx: {
-    home: string;
-    cliPath: string;
-    plan: ReturnType<typeof planInit>;
-    wantClaude: boolean;
-    opts: { build?: boolean; mcp?: boolean; hooks?: boolean; global?: boolean; statusline?: boolean };
-  },
-): void {
-    const { home, cliPath, plan, wantClaude, opts } = ctx;
-    const wantStatusline = statuslineWanted({ statusline: opts.statusline });
-
-    // Converge, don't just add. init writes the selected hosts; without this it
-    // never touches the rest, so a repo wired by an older version (or by the same
-    // version with different --agents) keeps that run's files forever — and
-    // `reconcileWiring` then keeps them *up to date*, which is worse than stale.
-    // Retract every host NOT being written now; `exclude` spares the ones about to
-    // be rewritten, and the graph cache is kept (init is one step from using it).
-    const retracted = changed(
-      runRetract(repo, { home, apply: true, global: opts.global, cache: false, exclude: ids }),
-    ).filter((r) => r.action !== "skipped-unparseable");
-    for (const r of retracted) console.error(`- removed ${r.path} (${r.what}) — agent not selected`);
-
-    if (wantClaude) {
-      // `global`/`home` are threaded through alongside `statusline`: the claude layer
-      // writes under `~/.claude` now (hosts/claude-global.ts), so --no-global has to
-      // reach it or the flag would silently mean "no out-of-repo writes, except three".
-      const res = runInit(repo, { build: opts.build, cliPath, statusline: wantStatusline, global: opts.global, home });
-      console.error(`✓ wrote ${res.settingsPath}`);
-      for (const s of res.shims) console.error(`✓ wrote ${s}`);
-      console.error(`✓ wrote ${res.skill}`);
-      if (res.mcp.action === "skipped-unparseable")
-        console.error(`⚠ .mcp.json: ${res.mcp.path} left unchanged (not valid JSON) — add the graft server manually`);
-      else if (res.mcp.action === "unchanged")
-        console.error(`· mcp claude: ${res.mcp.path} (already registered)`);
-      else
-        console.error(`✓ mcp claude: ${res.mcp.path} (${res.mcp.action}) — restart Claude Code to load the graft MCP server`);
-      console.error(res.built ? "✓ built the graph (graft build)" : "· skipped graph build");
-      if (!wantStatusline) console.error("· skipped Claude Code statusLine (--no-statusline)");
-      for (const w of res.warnings) console.error(`⚠ ${w}`);
-    }
-
-    // `ids` is already resolved, so hosts init is always driven by an explicit
-    // list — never by its own detection fallback.
-    const others = ids.filter((id) => id !== "claude");
-    if (others.length > 0) {
-      const r = runHostsInit(repo, {
-        agents: others,
-        home,
-        mcp: opts.mcp,
-        hooks: opts.hooks,
-        global: opts.global,
-      });
-      for (const w of r.written) console.error(`✓ ${w.id}: ${w.path} (${w.action})`);
-      for (const m of r.mcp) console.error(`✓ mcp ${m.id}: ${m.path} (${m.action})`);
-      for (const h of r.hooks) console.error(`✓ hook ${h.id}: ${h.path} (${h.action})`);
-      // Only worth saying when there was actually something out-of-repo to skip.
-      if (opts.global === false && selectedWrites(plan, ids).some((w) => w.scope === "global"))
-        console.error("· skipped out-of-repo writes (--no-global)");
-    }
-
-    // Record WHICH graft wrote this repo's agent files, and under which flags.
-    // Every entry point compares this against the running binary and re-writes
-    // them on a mismatch, so an `npm i -g` upgrade reaches the hooks/skill/rules
-    // too — not just the binary. The flags ride along so a refresh replays the
-    // user's choices (notably --no-global) instead of overriding them.
-    writeStamp(repo, currentVersion, ids, {
-      global: opts.global !== false,
-      mcp: opts.mcp !== false,
-      hooks: opts.hooks !== false,
-      statusline: wantStatusline,
-    });
-
-    // Every host's wiring points at graft/, so the graph is built whatever was
-    // selected — not only when Claude Code is in the list (runInit does its own).
-    if (!wantClaude) {
-      console.error(
-        buildGraphIfMissing(repo, { build: opts.build, cliPath })
-          ? "✓ built the graph (graft build)"
-          : "· skipped graph build",
-      );
-    }
-
-}
-
-/** Group a retraction report by host, so the output reads as "what leaves each agent". */
-function formatRetractions(rs: Retraction[], apply: boolean): string {
-  const hit = changed(rs);
-  if (hit.length === 0) return "· nothing to remove — no graft wiring found here";
-  const verb = apply ? "removed" : "would remove";
-  const lines: string[] = [];
-  const byHost = new Map<string, Retraction[]>();
-  for (const r of hit) {
-    const k = byHost.get(r.hostId) ?? [];
-    k.push(r);
-    byHost.set(r.hostId, k);
-  }
-  for (const [host, items] of byHost) {
-    lines.push(`\n${host}:`);
-    for (const r of items) {
-      const mark =
-        r.action === "skipped-unparseable"
-          ? "⚠"
-          : r.action === "deleted"
-            ? "-"
-            : "~";
-      const note =
-        r.action === "skipped-unparseable"
-          ? " — not valid JSON, left untouched (remove the graft entry by hand)"
-          : r.action === "deleted"
-            ? ` (${r.what} — deleted)`
-            : ` (${r.what})`;
-      const scope = r.scope === "global" ? " [machine-wide]" : "";
-      lines.push(`  ${mark} ${verb}: ${r.path}${scope}${note}`);
-    }
-  }
-  return lines.join("\n").replace(/^\n/, "");
-}
-
-program
-  .command("uninstall")
-  .description("Remove every file and config entry graft has written to this repo (the inverse of init)")
-  .argument("[dir]", "target repo directory", ".")
-  .option("-y, --yes", "actually remove (without this, prints what it would remove and exits)")
-  .option("--keep-cache", "keep graft/ and the .gitignore entries — wiring only")
-  .option("--no-global", "leave out-of-repo files alone (~/.codex, ~/.gemini)")
-  .action((dir: string, opts: { yes?: boolean; keepCache?: boolean; global?: boolean }) => {
-    const repo = resolve(dir);
-    const home = homedir();
-    const common = { home, global: opts.global, cache: opts.keepCache ? false : true };
-
-    if (!opts.yes) {
-      console.error(formatRetractions(planRetract(repo, common), false));
-      console.error("\nDry run — nothing was touched. Re-run with -y to remove.");
-      if (opts.global !== false)
-        console.error("Entries marked [machine-wide] affect every project; --no-global skips them.");
-      return;
-    }
-    const done = runRetract(repo, { ...common, apply: true });
-    console.error(formatRetractions(done, true));
-    const bad = changed(done).filter((r) => r.action === "skipped-unparseable");
-    console.error(
-      bad.length
-        ? `\n⚠ ${bad.length} file(s) could not be parsed and were left as-is — see above.`
-        : "\n✓ graft fully removed. `graft init` re-wires from scratch.",
-    );
-  });
-
-const brain = program
-  .command("brain")
-  .description("The Trail brain attached to this repo: the rules mined from its own history");
-
-brain
-  .command("connect")
-  .description("Attach a brain to this repo and pull its rules")
-  .argument("<handoff>", "<brainId>:<token>, or a bare brain id with GRAFT_BRAIN_TOKEN set")
-  .argument("[dir]", "target repo directory", ".")
-  .action(async (handoff: string, dir: string) => {
-    const parsed = parseBrainArg(handoff);
-    if ("error" in parsed) {
-      console.error(`✗ ${parsed.error}`);
-      process.exitCode = 1;
-      return;
-    }
-    const repo = resolve(dir);
-    const res = await connectBrain(repo, parsed, { home: homedir() });
-    if (res.warning) {
-      console.error(`⚠ ${res.warning}`);
-      return;
-    }
-    if (res.ruleCount === 0) {
-      // The normal case on the local route: the brain exists but nothing has
-      // read the repo yet. Saying "0 rules" without saying why reads as a
-      // failure, and the next step is the whole point.
-      console.error("✓ attached this repo to the brain — it has no rules yet");
-      console.error("· run `graft brain push` to read this repository into it");
-      return;
-    }
-    console.error(`✓ pulled ${res.ruleCount} rule(s) from ${parsed.brainId}`);
-    for (const w of res.writes) console.error(`✓ ${w.path} (${w.action})`);
-  });
-
-brain
-  .command("pull")
-  .description("Re-pull the attached brain's rules and rewrite the agent instruction files")
-  .argument("[dir]", "target repo directory", ".")
-  .action(async (dir: string) => {
-    const repo = resolve(dir);
-    const res = await pullBrain(repo, { home: homedir() });
-    if (!res) {
-      console.error("· no brain attached — run `graft brain connect <brainId>:<token>`");
-      return;
-    }
-    if (res.warning) {
-      console.error(`⚠ ${res.warning}`);
-      process.exitCode = 1;
-      return;
-    }
-    console.error(`✓ pulled ${res.ruleCount} rule(s)`);
-    for (const w of res.writes) console.error(`✓ ${w.path} (${w.action})`);
-  });
-
-brain
-  .command("push")
-  .description("Read THIS repo on your machine and build its brain — no GitHub App, works on private repos")
-  .argument("[dir]", "target repo directory", ".")
-  .option("--no-approve", "leave the mined rules as drafts for review")
-  .action(async (dir: string, opts: { approve?: boolean }) => {
-    const repo = resolve(dir);
-    const link = readLink(repo);
-    if (!link) {
-      console.error("· no brain attached — run `graft brain connect <brainId>:<token>` first");
-      process.exitCode = 1;
-      return;
-    }
-    // What the website said this brain is for. Checked BEFORE any reading, so
-    // standing in the wrong checkout costs a message rather than a brain full
-    // of another repository's rules — a mistake that is silent afterwards,
-    // because the rules look perfectly plausible, just not about your code.
-    const here = repoSlugFromGit(repo);
-    const expected = await fetchExpectedRepo(link);
-    if (expected && here && !sameRepo(expected.slug, `${here.owner}/${here.name}`)) {
-      console.error(`✗ this brain is for ${expected.slug}, but you are in ${here.owner}/${here.name}`);
-      console.error(`  cd into ${expected.slug} and run this again, or attach a different brain here.`);
-      process.exitCode = 1;
-      return;
-    }
-
-    // The graph is what symbol anchors are resolved against, so a rule mined
-    // here can later go stale on its own. Without one the ingest still works;
-    // its rules simply govern the repo rather than a symbol in it.
-    const graph = loadGraphCached(contextDirFor(repo, program.opts<GlobalOpts>().dir));
-    if (!graph) console.error("· no graph yet — run `graft build` first so rules can be anchored to symbols");
-
-    const label = expected?.slug ?? (here ? `${here.owner}/${here.name}` : "this repository");
-    console.error(`· reading ${label} — commit messages, pull-request discussion and the docs in the tree.`);
-    console.error("  No file contents leave this machine.");
-    const built = await buildLocalDigest(repo, graph, { autoApprove: opts.approve !== false });
-    if ("error" in built) {
-      console.error(`✗ ${built.error}`);
-      process.exitCode = 1;
-      return;
-    }
-    const d = built.digest;
-    if (built.warning) console.error(`⚠ ${built.warning}`);
-    console.error(
-      `· ${d.commits.length} commits, ${d.threads.length} discussions, ${d.symbols.length} symbols, ${d.sources.length} stated sources`,
-    );
-
-    const sent = await pushDigest(link, d);
-    if ("error" in sent) {
-      console.error(`✗ ${sent.error}`);
-      process.exitCode = 1;
-      return;
-    }
-    const brainLabel = expected?.brainName ? `“${expected.brainName}”` : link.brainId;
-    console.error(`✓ sent ${d.owner}/${d.name} to ${brainLabel}`);
-    console.error("· it is being mined into rules now — a few minutes. Watch it finish in your browser.");
-    console.error("  The rules reach this repo on their own; nothing else to run.");
-  });
-
-brain
-  .command("status")
-  .description("Show the attached brain, how many rules are cached, and how many still match the code")
-  .argument("[dir]", "target repo directory", ".")
-  .option("--json", "machine-readable output")
-  .action((dir: string, opts: { json?: boolean }) => {
-    const repo = resolve(dir);
-    const { link, rules, fetchedAt } = brainStatus(repo);
-    // Resolve every cached rule against the CURRENT graph, so the count of stale
-    // rules is the real one rather than what was true at pull time. This is the
-    // number worth surfacing: it says how far the codebase has drifted from what
-    // the team decided.
-    const graph = loadGraphCached(contextDirFor(repo, program.opts<GlobalOpts>().dir));
-    const applied = rulesForPointers(
-      (graph?.nodes ?? []).map((n) => `${n.path}:${n.span}`),
-      rules,
-      graph,
-    );
-    if (opts.json) {
-      console.log(JSON.stringify({ brainId: link?.brainId ?? null, cached: rules.length, fetchedAt, anchored: applied.length, stale: applied.filter((a) => a.stale).length }, null, 2));
-      return;
-    }
-    if (!link) {
-      console.error("· no brain attached — run `graft brain connect <brainId>:<token>`");
-      return;
-    }
-    console.error(`brain ${link.brainId}`);
-    console.error(`  ${rules.length} rule(s) cached${fetchedAt ? `, pulled ${new Date(fetchedAt).toISOString()}` : ""}`);
-    if (!graph) {
-      console.error("  no graph yet — run `graft build` to see which rules still match the code");
-      return;
-    }
-    const stale = applied.filter((a) => a.stale);
-    console.error(`  ${applied.length} anchored to symbols in this repo`);
-    console.error(
-      stale.length
-        ? `  ${stale.length} describe code that has changed since:`
-        : "  none describe code that has changed since",
-    );
-    for (const a of stale.slice(0, 10)) console.error(`    - ${a.rule}\n      ${a.pointer}`);
-  });
-
-brain
-  .command("disconnect")
-  .description("Forget the attached brain (its rules stay in the instruction files until the next init)")
-  .argument("[dir]", "target repo directory", ".")
-  .action((dir: string) => {
-    const repo = resolve(dir);
-    clearLink(resolve(dir));
-    console.error(`✓ detached the brain from ${repo}`);
   });
 
 program.parseAsync().catch((err) => {

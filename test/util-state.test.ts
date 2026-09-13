@@ -85,7 +85,7 @@ test("patchBuildConfig preserves unrelated persisted build choices", () => {
 // ── resolveContextDir / GRAFT_DIR ──────────────────────────────────────────
 //
 // Everything in this module keyed only by a project dir (stats cache, sync
-// lock, session state, the upkeep stamp) resolves its `graft/` subpath
+// lock, and the build config) resolves its `graft/` subpath
 // through resolveContextDir, so hooks/sync-run/statusline honor GRAFT_DIR
 // the same way a direct `--dir` CLI call already does via contextDirFor.
 

@@ -24,7 +24,7 @@ CLI commands: `build`, `ask`, `grep`, `callers`, `skeleton`, `map`, `blast`, `ch
 | `src/hosts/`, `src/claude/`, `src/cli-picker.ts`, `src/cli-epilogue.ts`, `.claude/` | `init` and `uninstall`: hooks, statusline, skills, MCP entries and instruction files written into repositories, `~/.claude`, `~/.codex` and `~/.gemini` |
 | `src/upkeep.ts`, `src/upkeep-run.ts`, `scripts/tally-audit.mjs` | re-running `init` on every session start after an upgrade, and the `npm view` upgrade check |
 | `src/context/price.ts` | pricing the savings estimate in dollars |
-| `version`, `upgrade`, `telemetry`, `stats`, `init`, `uninstall`, `brain` commands | the command-line surface of the above |
+| `version`, `upgrade`, `telemetry`, `stats`, `init`, `uninstall`, `brain` (upstream renamed it `trail`, with `claude-md pull`) commands | the command-line surface of the above |
 | `.github/workflows/{blast,blast-cache,blast-pages,scorecard}.yml` | upstream's own PR bot and scorecard publishing |
 | `dotenv` | loading any `.env` in the working directory into every process |
 
